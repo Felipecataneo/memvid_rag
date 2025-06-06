@@ -1,41 +1,50 @@
-# Use Python 3.11 slim como base
+# Dockerfile para Render com dependências gráficas
 FROM python:3.11-slim
 
-# Define o diretório de trabalho
-WORKDIR /app
-
-# Instala dependências do sistema necessárias
+# Instala dependências do sistema necessárias para OpenCV/OpenGL
 RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    libffi-dev \
-    libssl-dev \
-    curl \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    libxvidcore-dev \
+    libx264-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libatlas-base-dev \
+    gfortran \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copia os arquivos de dependências
+# Configura variáveis de ambiente para headless
+ENV DISPLAY=:99
+ENV QT_QPA_PLATFORM=offscreen
+ENV OPENCV_VIDEOIO_PRIORITY_MSMF=0
+
+# Cria diretório de trabalho
+WORKDIR /app
+
+# Copia requirements e instala dependências Python
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Instala as dependências Python
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Copia o código da aplicação
+# Copia código da aplicação
 COPY . .
 
-# Cria o diretório para as memórias
+# Cria diretório para memórias
 RUN mkdir -p session_memories
 
-# Define variáveis de ambiente
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
-
-# Expõe a porta
+# Expõe porta
 EXPOSE 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
 
 # Comando para iniciar a aplicação
 CMD ["python", "main.py"]

@@ -12,6 +12,18 @@ aiofiles==23.2.1
 # Logging and monitoring
 structlog==23.2.0
 
+# OpenCV headless (sem dependências GUI)
+opencv-python-headless==4.8.1.78
+
+# Outras dependências que o Memvid pode precisar
+numpy>=1.21.0
+Pillow>=9.0.0
+requests>=2.28.0
+
+# Se o Memvid usar essas bibliotecas
+matplotlib>=3.5.0
+scipy>=1.9.0
+
 # Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
@@ -21,3 +33,6 @@ orjson==3.9.10
 
 google-generativeai
 pypdf2
+
+python-docx>=0.8.11
+markdown>=3.4.0
