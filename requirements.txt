@@ -1,0 +1,23 @@
+# Core FastAPI dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Memvid and related dependencies
+memvid
+# Additional utilities
+python-dotenv==1.0.0
+aiofiles==23.2.1
+
+# Logging and monitoring
+structlog==23.2.0
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Optional: For better performance
+orjson==3.9.10
+
+google-generativeai
+pypdf2
