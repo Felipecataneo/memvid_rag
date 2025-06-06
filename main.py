@@ -300,7 +300,7 @@ async def root():
 if __name__ == "__main__":
     logger.info(f"🚀 Servidor MCP Memvid iniciando em {HOST}:{PORT}")
     uvicorn.run(
-        "mcp_server_fixed:app",
+        "main:app",
         host=HOST,
         port=PORT,
         reload=False,
