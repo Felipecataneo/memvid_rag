@@ -1,248 +1,271 @@
+# mcp_server.py
+#
+# SERVIDOR DE API AVANÇADO PARA MEMVID (Versão FastAPI Final - CORRIGIDA)
+#
+# DESCRIÇÃO:
+# API robusta para criar "memórias de sessão" a partir de arquivos e conversar
+# com elas. O endpoint /chat agora requer um `memory_id`, garantindo que toda
+# conversa seja contextualizada por um documento processado.
+#
+# FLUXO DE TRABALHO:
+# 1. POST /upload: Cliente envia um arquivo (PDF, TXT, etc.). Servidor processa
+#    com Memvid e retorna um `memory_id`.
+# 2. GET /chat?query=...&memory_id=...: Cliente envia a query e o ID da memória.
+#    O servidor usa o MemvidChat para encontrar contexto e transmite a resposta do LLM.
+#
+# DEPENDÊNCIAS:
+# pip install "memvid[llm,web]" uvicorn python-multipart
+#
+# VARIÁVEIS DE AMBIENTE (a serem configuradas no Render):
+# GOOGLE_API_KEY, OPENAI_API_KEY, ou ANTHROPIC_API_KEY
+
 import os
 import asyncio
 import json
 import uuid
 import logging
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Generator
+import traceback
 
 import uvicorn
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Importações do seu projeto memvid
+# Importações seguras dos módulos Memvid
 try:
-    from memvid.encoder import MemvidEncoder
-    from memvid.chat import MemvidChat
+    from memvid import MemvidEncoder
+    from memvid import MemvidChat
     from memvid.config import get_codec_parameters
-    from memvid.llm_client import LLMClient, create_llm_client
+    from memvid.retriever import MemvidRetriever
+    from memvid.llm_client import LLMClient
 except ImportError as e:
-    logging.error(f"Erro ao importar módulos memvid: {e}")
-    raise
+    logging.basicConfig(level=logging.ERROR)
+    logging.error(f"Erro crítico: Não foi possível importar os módulos do Memvid. {e}")
+    logging.error("Certifique-se de que a biblioteca 'memvid' está instalada corretamente.")
+    exit(1)
 
 # --- CONFIGURAÇÃO DE LOGGING ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÃO GLOBAL ---
 OUTPUT_DIR = Path("session_memories")
-VIDEO_CODEC = "mp4v"
+VIDEO_CODEC = "mp4v"  # Codec leve que não requer FFmpeg/Docker
 LLM_PROVIDER = os.getenv("MEMVID_PROVIDER", "google")
 
-# Verificação de variáveis de ambiente necessárias
-required_env_vars = {
-    "google": "GOOGLE_API_KEY",
-    "openai": "OPENAI_API_KEY", 
-    "anthropic": "ANTHROPIC_API_KEY"
-}
-
-if LLM_PROVIDER in required_env_vars:
-    if not os.getenv(required_env_vars[LLM_PROVIDER]):
-        logger.warning(f"Variável de ambiente {required_env_vars[LLM_PROVIDER]} não encontrada")
+# Validação da chave de API na inicialização
+try:
+    from memvid.llm_client import LLMClient
+    if not LLMClient.check_api_keys().get(LLM_PROVIDER, False):
+        logger.warning(f"AVISO: Chave de API para o provedor '{LLM_PROVIDER}' não encontrada. O servidor pode não funcionar.")
+        logger.warning("Defina a variável de ambiente apropriada (ex: GOOGLE_API_KEY).")
+except Exception as e:
+    logger.error(f"Erro ao verificar chaves de API: {e}")
 
 try:
     VIDEO_EXT = get_codec_parameters(VIDEO_CODEC)["video_file_type"]
-except Exception as e:
-    logger.error(f"Erro ao obter parâmetros do codec: {e}")
-    VIDEO_EXT = "mp4"  # fallback
+except KeyError:
+    logger.error(f"Codec '{VIDEO_CODEC}' não encontrado na configuração. Usando '.mp4' como fallback.")
+    VIDEO_EXT = "mp4"
 
 app = FastAPI(
-    title="Memvid MCP Server",
-    description="API para processamento de documentos e chat com contexto usando Memvid",
-    version="1.0.0"
+    title="Memvid API Server",
+    description="API para processar documentos e interagir com eles usando a memória de vídeo do Memvid.",
+    version="1.1.0"
 )
 
-# Garante que o diretório de memórias exista
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# --- CONFIGURAÇÃO DE CORS ---
+# --- MIDDLEWARE DE CORS ---
 origins = [
     "http://localhost:3000",
     "http://localhost:5173",
-    "http://localhost:8000",
+    "http://localhost:8080",
+    "http://127.0.0.1:5500",
     "null",
-    # Adicione sua URL de produção aqui quando necessário
-    # "https://seu-cliente.vercel.app",
+    "*",  # Para desenvolvimento - remover em produção
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# --- MIDDLEWARE DE LOGGING ---
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = asyncio.get_event_loop().time()
-    response = await call_next(request)
-    process_time = asyncio.get_event_loop().time() - start_time
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
-    return response
 
 # --- ENDPOINTS DA API ---
 
 @app.get("/")
 async def get_root():
     """Endpoint raiz para verificação de status."""
-    return {
-        "status": "online", 
-        "message": "Servidor de API Memvid está rodando.",
-        "version": "1.0.0",
-        "provider": LLM_PROVIDER
-    }
+    return {"status": "online", "message": "Servidor de API Memvid está rodando."}
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint para o Render."""
-    return {"status": "healthy", "timestamp": asyncio.get_event_loop().time()}
+    """Endpoint de verificação de saúde para serviços como o Render."""
+    return {"status": "healthy"}
 
 @app.post("/upload")
 async def upload_and_create_memory(file: UploadFile = File(...)):
-    """
-    Recebe um arquivo, processa com Memvid e retorna um ID de memória.
-    """
+    """Recebe um arquivo, processa com Memvid e retorna um ID de memória."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="Nome do arquivo não fornecido.")
 
-    # Verificação de tamanho do arquivo (limite de 50MB)
-    if file.size and file.size > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Arquivo muito grande. Limite: 50MB")
-
-    # Gera um ID único para esta sessão de memória
+    # Gera um ID único e seguro para esta sessão de memória
     memory_id = str(uuid.uuid4())
-    temp_file_path = OUTPUT_DIR / f"temp_{memory_id}_{file.filename}"
+    temp_file_path = OUTPUT_DIR / f"temp_{memory_id}_{Path(file.filename).name}"
     video_path = OUTPUT_DIR / f"{memory_id}.{VIDEO_EXT}"
     index_path = OUTPUT_DIR / f"{memory_id}_index.json"
 
     try:
-        # Salva o arquivo temporariamente
         content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Arquivo enviado está vazio.")
+
         with open(temp_file_path, "wb") as buffer:
             buffer.write(content)
 
-        logger.info(f"📄 Arquivo recebido: {file.filename} ({file.content_type}) - {len(content)} bytes")
+        logger.info(f"📄 Arquivo recebido: {file.filename} | Tamanho: {len(content) / 1024:.2f} KB")
         logger.info(f"🧠 Processando para memory_id: {memory_id}")
 
-        # Processa o arquivo com MemvidEncoder
         encoder = MemvidEncoder()
         file_ext = Path(file.filename).suffix.lower()
 
         if file_ext == '.pdf':
             encoder.add_pdf(str(temp_file_path))
         elif file_ext in ['.txt', '.md']:
-            with open(temp_file_path, "r", encoding='utf-8') as f:
-                content_text = f.read()
-                if not content_text.strip():
-                    raise HTTPException(status_code=400, detail="Arquivo de texto está vazio.")
-                encoder.add_text(content_text)
+            encoder.add_text(temp_file_path.read_text(encoding='utf-8', errors='ignore'))
         else:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Tipo de arquivo não suportado: {file_ext}. Suportados: .pdf, .txt, .md"
-            )
+            raise HTTPException(status_code=415, detail=f"Tipo de arquivo não suportado: {file_ext}")
         
         if not encoder.chunks:
-            raise HTTPException(status_code=400, detail="Nenhum conteúdo extraído do arquivo.")
+            raise HTTPException(status_code=400, detail="Nenhum conteúdo de texto pôde ser extraído do arquivo.")
 
-        # Constrói o vídeo e o índice da memória
         encoder.build_video(str(video_path), str(index_path), codec=VIDEO_CODEC)
-        logger.info(f"✅ Memória criada com sucesso: {video_path}")
+        logger.info(f"✅ Memória '{memory_id}' criada com {len(encoder.chunks)} chunks.")
 
-        return {
-            "memory_id": memory_id, 
-            "filename": file.filename, 
-            "chunks_created": len(encoder.chunks),
-            "video_path": str(video_path.name),
-            "index_path": str(index_path.name)
-        }
+        return {"memory_id": memory_id, "filename": file.filename, "chunks_created": len(encoder.chunks)}
 
-    except HTTPException as e:
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Erro ao processar o arquivo: {e}")
-        raise HTTPException(status_code=500, detail=f"Falha ao processar o arquivo: {str(e)}")
+        logger.error(f"❌ Erro ao processar o arquivo para memory_id '{memory_id}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Falha ao processar o arquivo. {e}")
     finally:
-        # Limpa o arquivo temporário
         if temp_file_path.exists():
-            try:
-                temp_file_path.unlink()
-            except Exception as e:
-                logger.warning(f"Erro ao remover arquivo temporário: {e}")
-# No seu main.py, a função sse_chat_streamer
-async def sse_chat_streamer(query: str, memory_id: Optional[str]) -> AsyncGenerator[str, None]:
-    """
-    Gerador que transmite a resposta do chat, usando Memvid se um memory_id for fornecido.
-    """
-    # Verificação robusta: memory_id é agora obrigatório para o chat
-    if not memory_id:
-        error_msg = "O 'memory_id' é obrigatório para o chat. Por favor, faça o upload de um documento primeiro."
-        logger.error(error_msg)
-        yield f"data: {json.dumps({'error': error_msg, 'code': 'MISSING_MEMORY_ID'})}\n\n"
-        yield f"data: {json.dumps({'event': 'close'})}\n\n"
-        return
+            temp_file_path.unlink()
 
+def sse_chat_streamer(query: str, memory_id: str) -> Generator[str, None, None]:
+    """
+    Gerador SÍNCRONO que transmite a resposta do chat com tratamento robusto de erros.
+    """
     try:
-        llm_provider = os.getenv("MEMVID_PROVIDER", "google")
-        
+        # Verificar se os arquivos de memória existem
         video_path = OUTPUT_DIR / f"{memory_id}.{VIDEO_EXT}"
         index_path = OUTPUT_DIR / f"{memory_id}_index.json"
 
         if not video_path.exists() or not index_path.exists():
-            raise FileNotFoundError("ID de memória inválido ou arquivos não encontrados.")
+            error_msg = f"Arquivos de memória para o ID '{memory_id}' não encontrados."
+            logger.error(error_msg)
+            yield f"data: {json.dumps({'error': error_msg, 'code': 'MEMORY_NOT_FOUND'})}\n\n"
+            return
         
-        logger.info(f"🎬 Usando memória: {memory_id} com provedor: {llm_provider}")
+        logger.info(f"🎬 Usando memória: {memory_id} com provedor: {LLM_PROVIDER}")
         
-        # Usando a sintaxe correta do file_chat.py
-        chat_handler = MemvidChat(
-            video_file=str(video_path),
-            index_file=str(index_path),
-            llm_provider=llm_provider
+        # Verificar se a chave da API está configurada
+        try:
+            llm_client = LLMClient(provider=LLM_PROVIDER)
+        except Exception as e:
+            error_msg = f"Erro ao inicializar o cliente LLM: {str(e)}"
+            logger.error(error_msg)
+            yield f"data: {json.dumps({'error': error_msg, 'code': 'LLM_INIT_ERROR'})}\n\n"
+            return
+        
+        # PASSO 1: Obter o contexto usando o Retriever
+        try:
+            retriever = MemvidRetriever(video_file=str(video_path), index_file=str(index_path))
+            context_chunks = retriever.search(query)
+            context_text = "\n".join(context_chunks)
+            logger.info(f"🧠 Contexto encontrado: {len(context_text)} caracteres.")
+        except Exception as e:
+            error_msg = f"Erro ao buscar contexto: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            yield f"data: {json.dumps({'error': error_msg, 'code': 'RETRIEVER_ERROR'})}\n\n"
+            return
+        
+        # PASSO 2: Preparar o prompt para o LLM
+        full_prompt_content = (
+            "Você é um assistente prestativo. Responda à pergunta do usuário com base apenas no contexto fornecido. "
+            "Se a resposta não estiver no contexto, diga que você não sabe.\n\n"
+            f"Contexto:\n---\n{context_text}\n---\n\n"
+            f"Pergunta: {query}\n\nResposta:"
         )
+
+        # Estrutura de mensagem correta para a API
+        messages = [
+            {'role': 'user', 'content': full_prompt_content}
+        ]
         
-        stream_iterator = chat_handler.chat(query, stream=True)
-
-        # O resto do código permanece o mesmo
-        yield f"data: {json.dumps({'event': 'start', 'memory_id': memory_id})}\n\n"
+        # PASSO 3: Iniciar o streaming
+        yield f"data: {json.dumps({'event': 'stream_start', 'memory_id': memory_id})}\n\n"
         
-        for chunk in stream_iterator:
-            if chunk:
-                yield f"data: {json.dumps({'token': chunk, 'type': 'content'})}\n\n"
-                await asyncio.sleep(0.001)
-
-        yield f"data: {json.dumps({'event': 'end'})}\n\n"
-
-    except FileNotFoundError as e:
-        logger.error(f"Arquivo não encontrado: {e}")
-        yield f"data: {json.dumps({'error': str(e), 'code': 'FILE_NOT_FOUND'})}\n\n"
+        try:
+            # Chamar o LLM com streaming
+            stream_iterator = llm_client.chat(messages, stream=True)
+            
+            # Verificar se o stream_iterator não é None
+            if stream_iterator is None:
+                error_msg = "O cliente LLM retornou None. Verifique a configuração da API."
+                logger.error(error_msg)
+                yield f"data: {json.dumps({'error': error_msg, 'code': 'LLM_STREAM_NULL'})}\n\n"
+                return
+            
+            # Iterar sobre as respostas do LLM
+            token_count = 0
+            for chunk in stream_iterator:
+                if chunk:
+                    token_count += 1
+                    yield f"data: {json.dumps({'token': chunk})}\n\n"
+                    
+            logger.info(f"✅ Stream concluído com {token_count} tokens para memory_id '{memory_id}'")
+            
+        except TypeError as e:
+            # Captura o erro "'NoneType' object is not iterable"
+            error_msg = f"Erro de iteração do LLM: {str(e)}. Verifique as configurações da API."
+            logger.error(error_msg, exc_info=True)
+            yield f"data: {json.dumps({'error': error_msg, 'code': 'LLM_ITERATION_ERROR'})}\n\n"
+            return
+            
     except Exception as e:
-        logger.error(f"❌ Erro durante o streaming: {e}")
-        yield f"data: {json.dumps({'error': str(e), 'code': 'STREAMING_ERROR'})}\n\n"
+        error_msg = f"Erro geral durante o streaming: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        yield f"data: {json.dumps({'error': error_msg, 'code': 'STREAM_ERROR', 'traceback': traceback.format_exc()})}\n\n"
     finally:
-        yield f"data: {json.dumps({'event': 'close'})}\n\n"
+        yield f"data: {json.dumps({'event': 'stream_end'})}\n\n"
+
 
 @app.get("/chat")
-async def chat_endpoint(request: Request):
-    """Endpoint SSE que recebe uma query e um memory_id opcional."""
-    query = request.query_params.get('query')
-    memory_id = request.query_params.get('memory_id')
+async def chat_endpoint(request: Request, query: str, memory_id: str):
+    """Endpoint de chat com validação robusta de parâmetros."""
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="O parâmetro 'query' é obrigatório e não pode ser vazio.")
+    
+    if not memory_id or not memory_id.strip():
+        raise HTTPException(status_code=400, detail="O parâmetro 'memory_id' é obrigatório para o chat.")
 
-    if not query:
-        return JSONResponse(
-            status_code=400, 
-            content={"error": "O parâmetro 'query' é obrigatório."}
-        )
+    logger.info(f"💬 Query recebida: '{query[:100]}...' | memory_id: {memory_id}")
+
+    # Verificar se a memória existe antes de iniciar o streaming
+    video_path = OUTPUT_DIR / f"{memory_id}.{VIDEO_EXT}"
+    index_path = OUTPUT_DIR / f"{memory_id}_index.json"
     
-    if not query.strip():
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Query não pode estar vazia."}
+    if not video_path.exists() or not index_path.exists():
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Memória com ID '{memory_id}' não encontrada. Faça upload de um arquivo primeiro."
         )
-    
-    logger.info(f"💬 Query recebida: '{query[:100]}...' | memory_id: {memory_id or 'Nenhum'}")
 
     return StreamingResponse(
         sse_chat_streamer(query, memory_id), 
@@ -250,11 +273,38 @@ async def chat_endpoint(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "*",
         }
     )
 
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str):
+    """Endpoint para remover arquivos de uma memória específica."""
+    logger.info(f"🗑️ Recebida requisição para deletar a memória: {memory_id}")
+    video_path = OUTPUT_DIR / f"{memory_id}.{VIDEO_EXT}"
+    index_path = OUTPUT_DIR / f"{memory_id}_index.json"
+    faiss_path = OUTPUT_DIR / f"{memory_id}_index.faiss"
+    
+    deleted_files_count = 0
+    for file_path in [video_path, index_path, faiss_path]:
+        if file_path.exists():
+            try:
+                file_path.unlink()
+                deleted_files_count += 1
+                logger.info(f"   - Arquivo removido: {file_path.name}")
+            except OSError as e:
+                logger.error(f"Erro ao remover o arquivo {file_path}: {e}")
+                # Continua tentando remover os outros arquivos
+    
+    if deleted_files_count == 0:
+        raise HTTPException(status_code=404, detail="Nenhum arquivo encontrado para esta memória.")
+    
+    return {"message": f"Memória {memory_id} e seus arquivos associados foram removidos."}
+
+# Endpoint para listar memórias (útil para debug)
 @app.get("/memories")
 async def list_memories():
     """Lista todas as memórias disponíveis."""
@@ -262,57 +312,19 @@ async def list_memories():
     for video_file in OUTPUT_DIR.glob(f"*.{VIDEO_EXT}"):
         memory_id = video_file.stem
         index_file = OUTPUT_DIR / f"{memory_id}_index.json"
-        
         if index_file.exists():
-            try:
-                with open(index_file, 'r') as f:
-                    index_data = json.load(f)
-                    memories.append({
-                        "memory_id": memory_id,
-                        "created": video_file.stat().st_ctime,
-                        "chunks": len(index_data.get('chunks', [])),
-                        "video_size": video_file.stat().st_size
-                    })
-            except Exception as e:
-                logger.warning(f"Erro ao ler índice {index_file}: {e}")
+            memories.append({
+                "memory_id": memory_id,
+                "video_file": video_file.name,
+                "index_file": index_file.name,
+                "created": video_file.stat().st_ctime
+            })
     
-    return {"memories": memories, "total": len(memories)}
+    return {"memories": memories, "count": len(memories)}
 
-@app.delete("/memories/{memory_id}")
-async def delete_memory(memory_id: str):
-    """Remove uma memória específica."""
-    video_path = OUTPUT_DIR / f"{memory_id}.{VIDEO_EXT}"
-    index_path = OUTPUT_DIR / f"{memory_id}_index.json"
-    
-    deleted_files = []
-    
-    if video_path.exists():
-        video_path.unlink()
-        deleted_files.append(str(video_path.name))
-    
-    if index_path.exists():
-        index_path.unlink()
-        deleted_files.append(str(index_path.name))
-    
-    if not deleted_files:
-        raise HTTPException(status_code=404, detail="Memória não encontrada.")
-    
-    return {"message": f"Memória {memory_id} removida.", "deleted_files": deleted_files}
-
-# --- TRATAMENTO DE ERROS GLOBAIS ---
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Erro não tratado: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Erro interno do servidor", "detail": str(exc)}
-    )
-
+# --- BLOCO DE EXECUÇÃO PRINCIPAL ---
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        log_level="info"
-    )
+    host = os.getenv("HOST", "0.0.0.0")
+    logger.info(f"Iniciando servidor Memvid em http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
